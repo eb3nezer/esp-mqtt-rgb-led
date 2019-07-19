@@ -17,29 +17,36 @@
 // http://pubsubclient.knolleary.net/
 #include <PubSubClient.h>
 
+#include <Ticker.h>
+#include <elapsedMillis.h>
+#include <ESP8266mDNS.h>
+#include <WiFiUdp.h>
+#include <ArduinoOTA.h>
+
+
+#include "configure_wifi.h"
+
+// If disconnected, how often to try to reconnect
+#define RECONNECT_POLLING_PERIOD 5000
+
 const bool debug_mode = CONFIG_DEBUG;
 const bool led_invert = CONFIG_INVERT_LED_LOGIC;
 
 const int redPin = CONFIG_PIN_RED;
-const int txPin = BUILTIN_LED; // On-board blue LED
+const int txPin = CONFIG_PIN_STATUS;
 const int greenPin = CONFIG_PIN_GREEN;
 const int bluePin = CONFIG_PIN_BLUE;
 const int whitePin = CONFIG_PIN_WHITE;
 
-const char* ssid = CONFIG_WIFI_SSID;
-const char* password = CONFIG_WIFI_PASS;
-
-const char* mqtt_server = CONFIG_MQTT_HOST;
-const char* mqtt_username = CONFIG_MQTT_USER;
-const char* mqtt_password = CONFIG_MQTT_PASS;
-const char* client_id = CONFIG_MQTT_CLIENT_ID;
-
-// Topics
-const char* light_state_topic = CONFIG_MQTT_TOPIC_STATE;
-const char* light_set_topic = CONFIG_MQTT_TOPIC_SET;
-
-const char* on_cmd = CONFIG_MQTT_PAYLOAD_ON;
-const char* off_cmd = CONFIG_MQTT_PAYLOAD_OFF;
+char mqtt_server[40];
+char mqtt_port[6] = "1883";
+char mqtt_user[64];
+char mqtt_password[64];
+char mqtt_state_topic[64];
+char mqtt_set_topic[64];
+char mqtt_device[64];
+char mqtt_payload_on[8] = "ON";
+char mqtt_payload_off[8] = "OFF";
 
 const int BUFFER_SIZE = JSON_OBJECT_SIZE(20);
 
@@ -93,17 +100,33 @@ const byte colors[][4] = {
 };
 const int numColors = 7;
 
+Ticker ticker;
+
 WiFiClient espClient;
 PubSubClient client(espClient);
+
+elapsedMillis reconnectTimeElapsed;
+
+void tick() {
+  //toggle state
+  int state = digitalRead(txPin);  // get the current state of GPIO1 pin
+  digitalWrite(txPin, !state);     // set pin to the opposite state
+}
 
 void setup() {
   pinMode(redPin, OUTPUT);
   pinMode(greenPin, OUTPUT);
   pinMode(bluePin, OUTPUT);
   pinMode(whitePin, OUTPUT);
+  analogWrite(redPin, 0);
+  analogWrite(greenPin, 0);
+  analogWrite(bluePin, 0);
+  analogWrite(whitePin, 0);
+  //use flash button as input
+  pinMode(D3, INPUT);
 
-  pinMode(txPin, OUTPUT);
-  digitalWrite(txPin, HIGH); // Turn off the on-board LED
+  pinMode(CONFIG_PIN_STATUS, OUTPUT);
+  digitalWrite(CONFIG_PIN_STATUS, LOW); // Turn off the on-board LED
 
   analogWriteRange(255);
 
@@ -111,32 +134,25 @@ void setup() {
     Serial.begin(115200);
   }
 
-  setup_wifi();
+  configureWifi(true);
+  
   client.setServer(mqtt_server, 1883);
   client.setCallback(callback);
+
+//#ifdef ENABLE_OTA
+  ArduinoOTA.setPort(OTA_PORT);
+  ArduinoOTA.setPassword((const char *)OTA_PASSWORD);
+  ArduinoOTA.onStart([]() {
+    setColor(0, 0, 0, 0);
+    Serial.println("Start");
+  });
+  ArduinoOTA.onEnd([]() {
+    setColor(realRed, realGreen, realBlue, realWhite);
+    Serial.println("\nEnd");
+  });
+//#endif
 }
 
-void setup_wifi() {
-
-  delay(10);
-  // We start by connecting to a WiFi network
-  Serial.println();
-  Serial.print("Connecting to ");
-  Serial.println(ssid);
-
-  WiFi.mode(WIFI_STA);
-  WiFi.begin(ssid, password);
-
-  while (WiFi.status() != WL_CONNECTED) {
-    delay(500);
-    Serial.print(".");
-  }
-
-  Serial.println("");
-  Serial.println("WiFi connected");
-  Serial.println("IP address: ");
-  Serial.println(WiFi.localIP());
-}
 
   /*
   SAMPLE PAYLOAD:
@@ -201,10 +217,10 @@ bool processJson(char* message) {
   }
 
   if (root.containsKey("state")) {
-    if (strcmp(root["state"], on_cmd) == 0) {
+    if (strcmp(root["state"], mqtt_payload_on) == 0) {
       stateOn = true;
     }
-    else if (strcmp(root["state"], off_cmd) == 0) {
+    else if (strcmp(root["state"], mqtt_payload_off) == 0) {
       stateOn = false;
     }
   }
@@ -304,7 +320,7 @@ void sendState() {
 
   JsonObject& root = jsonBuffer.createObject();
 
-  root["state"] = (stateOn) ? on_cmd : off_cmd;
+  root["state"] = (stateOn) ? mqtt_payload_on : mqtt_payload_off;
   JsonObject& color = root.createNestedObject("color");
   color["r"] = red;
   color["g"] = green;
@@ -329,23 +345,26 @@ void sendState() {
   char buffer[root.measureLength() + 1];
   root.printTo(buffer, sizeof(buffer));
 
-  client.publish(light_state_topic, buffer, true);
+  client.publish(mqtt_state_topic, buffer, true);
 }
 
 void reconnect() {
-  // Loop until we're reconnected
-  while (!client.connected()) {
-    Serial.print("Attempting MQTT connection...");
-    // Attempt to connect
-    if (client.connect(client_id, mqtt_username, mqtt_password)) {
-      Serial.println("connected");
-      client.subscribe(light_set_topic);
-    } else {
-      Serial.print("failed, rc=");
-      Serial.print(client.state());
-      Serial.println(" try again in 5 seconds");
-      // Wait 5 seconds before retrying
-      delay(5000);
+  if (!client.connected()) {
+    if (reconnectTimeElapsed > RECONNECT_POLLING_PERIOD) {
+      reconnectTimeElapsed = 0;
+      Serial.print("Attempting MQTT connection...");
+      ticker.attach(0.05, tick);
+      // Attempt to connect
+      if (client.connect(mqtt_device, mqtt_user, mqtt_password)) {
+        Serial.println("connected");
+        client.subscribe(mqtt_set_topic);
+      } else {
+        Serial.print("failed, rc=");
+        Serial.print(client.state());
+        Serial.println(" try again in 5 seconds");
+      }
+      ticker.detach();
+      digitalWrite(CONFIG_PIN_STATUS, LOW);
     }
   }
 }
@@ -375,11 +394,19 @@ void setColor(int inR, int inG, int inB, int inW) {
 }
 
 void loop() {
-
+  // Check for user pressing the onboard NodeMCU/ESP-12E "FLASH" button, which means reconfigure
+  if (digitalRead(D3) == LOW) {
+    configureWifi(false);
+  }
+  
   if (!client.connected()) {
     reconnect();
   }
-  client.loop();
+  if (client.connected()) {
+    client.loop();    
+  }
+
+  ArduinoOTA.handle();
 
   if (flash) {
     if (startFlash) {
